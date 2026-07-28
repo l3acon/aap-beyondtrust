@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools >= 68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aap-beyondtrust-credential-plugin"
+version = "0.1.0"
+description = "AAP/AWX credential plugin for BeyondTrust Password Safe"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">= 3.11"
+dependencies = ["requests"]
+keywords = ["ansible", "aap", "awx", "beyondtrust", "credential"]
+authors = [{ name = "l3acon" }]
+
+[project.urls]
+Repository = "https://github.com/l3acon/aap-beyondtrust"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Register under BOTH entry point groups for compatibility.
+# Modern AWX (awx-plugins repo) scans awx_plugins.credentials;
+# older AAP/AWX scans awx.credential_plugins.
+# Having both is harmless — only the active group will be loaded.
+
+[project.entry-points."awx_plugins.credentials"]
+beyondtrust_password_safe = "beyondtrust_credential_plugin:beyondtrust_plugin"
+
+[project.entry-points."awx.credential_plugins"]
+beyondtrust_password_safe = "beyondtrust_credential_plugin:beyondtrust_plugin"
