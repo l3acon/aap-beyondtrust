@@ -89,9 +89,9 @@ Since AAP 2.7 on RHEL runs the controller as an immutable Podman container, the 
 
 ### Step 1: Identify the Base Controller Image
 
-The default controller image for AAP 2.7 is:
+The default controller image for our AAP 2.7 environment is:
 ```
-registry.redhat.io/ansible-automation-platform-25/controller-rhel9:latest
+quay.io/aap/ansible-automation-platform-27-next/controller-rhel9:latest
 ```
 
 Verify the exact image/tag in use on your system:
@@ -250,11 +250,13 @@ Rather than raw HTTP calls, they depend on a vendor-provided Python SDK. BeyondT
 
 ## Open Questions / Next Steps
 
-- [ ] Confirm the exact base controller image tag running in our AAP 2.7 environment
-- [ ] Determine which entry point group (`awx_plugins.credentials` vs `awx.credential_plugins`) is active
+- [x] Confirm the exact base controller image tag → `quay.io/aap/ansible-automation-platform-27-next/controller-rhel9:latest`
+- [x] Determine which entry point group is active → `awx_plugins.credentials` (modern group; legacy group is empty)
+- [x] Plugin installs into venv at `/var/lib/awx/venv/awx/` (Python 3.12)
+- [x] Deployed and registered as credential type ID=33 on test environment
 - [ ] Validate BeyondTrust API connectivity from the controller container's network namespace
 - [ ] Determine BeyondTrust auto-approve policy configuration for the AAP service account
-- [ ] Test the plugin in a non-production AAP instance first
+- [ ] End-to-end test with a real BeyondTrust instance
 - [ ] Set up CI to rebuild the custom image on base image updates
 
 ## References

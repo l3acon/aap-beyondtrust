@@ -7,14 +7,14 @@
 # containerized deployment. Find it with:
 #   podman ps --format '{{.Image}}' | grep controller
 
-ARG BASE_IMAGE=registry.redhat.io/ansible-automation-platform-25/controller-rhel9:latest
+ARG BASE_IMAGE=quay.io/aap/ansible-automation-platform-27-next/controller-rhel9:latest
 FROM ${BASE_IMAGE}
 
 USER root
 
 COPY . /tmp/beyondtrust-plugin/
 
-RUN pip install --no-cache-dir /tmp/beyondtrust-plugin/ && \
+RUN /var/lib/awx/venv/awx/bin/pip install --no-cache-dir /tmp/beyondtrust-plugin/ && \
     rm -rf /tmp/beyondtrust-plugin/
 
 USER 1000
