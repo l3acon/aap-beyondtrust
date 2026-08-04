@@ -1,0 +1,51 @@
+---
+# switch-controller-image.yml
+#
+# Switches the AAP controller containers between locally-tagged images.
+# Does NOT require the full AAP installer or network/registry access.
+#
+# Usage:
+#   ansible-playbook switch-controller-image.yml -e image_tag=beyondtrust
+#   ansible-playbook switch-controller-image.yml -e image_tag=stock
+#
+# Prerequisites:
+#   - Images must be tagged locally:
+#       localhost/controller-rhel9:stock        (original Red Hat image)
+#       localhost/controller-rhel9:beyondtrust  (custom image with plugin)
+#   - Must be run on the AAP controller host as the AAP service user
+#   - Requires the containers.podman collection (included in AAP installer bundle)
+
+- name: Switch AAP controller image
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    image_tag: "{{ image_tag | default('beyondtrust') }}"
+    controller_image: "localhost/controller-rhel9:{{ image_tag }}"
+
+  tasks:
+    - name: Validate image_tag is provided
+      ansible.builtin.assert:
+        that:
+          - image_tag is defined
+          - image_tag | length > 0
+        fail_msg: "image_tag is required. Usage: -e image_tag=beyondtrust or -e image_tag=stock"
+
+    - name: Validate image exists locally
+      containers.podman.podman_image_info:
+        name: "{{ controller_image }}"
+      register: _image_info
+      failed_when: _image_info.images | length == 0
+
+    - name: Display target
+      ansible.builtin.debug:
+        msg: "Switching controller to: {{ controller_image }}"
+
+    - name: Switch controller containers
+      ansible.builtin.include_tasks:
+        file: "{{ playbook_dir }}/switch-controller-tasks.yml"
+
+    - name: Switch complete
+      ansible.builtin.debug:
+        msg: "Controller is now running: {{ controller_image }}"

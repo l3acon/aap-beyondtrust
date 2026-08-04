@@ -1,0 +1,291 @@
+---
+# install-plugin.yml
+#
+# End-to-end installation: builds the custom image and switches the
+# controller to it in one step.
+#
+# Usage:
+#   ansible-playbook install-plugin.yml
+#
+# To uninstall (revert to stock):
+#   ansible-playbook switch-controller-image.yml -e image_tag=stock
+#
+# Optional variables:
+#   -e force_rebuild=true    Rebuild image even if it already exists
+#   -e skip_prechecks=true   Skip environment pre-checks (not recommended)
+
+- name: Install BeyondTrust credential plugin
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    plugin_source: "{{ playbook_dir }}"
+    force_rebuild: false
+    skip_prechecks: false
+
+  tasks:
+    # ==================================================================
+    # ENVIRONMENT PRE-CHECKS
+    # ==================================================================
+    - name: Environment pre-checks
+      when: not skip_prechecks | bool
+      block:
+        - name: Check running as non-root user
+          ansible.builtin.assert:
+            that:
+              - ansible_user_uid != '0'
+              - ansible_user_id != 'root'
+            fail_msg: >-
+              This playbook must run as the AAP service user (not root).
+              The containerized AAP runs as a non-root user with podman.
+
+        - name: Check podman is available
+          ansible.builtin.command:
+            cmd: podman --version
+          changed_when: false
+          register: _podman_version
+
+        - name: Assert podman version is sufficient
+          ansible.builtin.assert:
+            that:
+              - _podman_version.stdout is search('podman version [4-9]|podman version [1-9][0-9]')
+            fail_msg: >-
+              Podman 4.x or later is required. Found: {{ _podman_version.stdout }}
+
+        - name: Check umask
+          ansible.builtin.shell: umask
+          changed_when: false
+          register: _umask
+
+        - name: Assert umask is not too restrictive
+          ansible.builtin.assert:
+            that:
+              - _umask.stdout | int <= 27
+            fail_msg: >-
+              umask {{ _umask.stdout }} is too restrictive. Files installed
+              into the container venv must be world-readable. The AWX venv
+              runs as uid 1000 but pip installs files as root during build.
+              Run: umask 0022 && ansible-playbook install-plugin.yml
+            success_msg: "umask {{ _umask.stdout }} OK"
+
+        - name: Check SELinux status
+          ansible.builtin.command:
+            cmd: getenforce
+          changed_when: false
+          register: _selinux
+          ignore_errors: true
+
+        - name: Check SELinux booleans for container access
+          ansible.builtin.command:
+            cmd: getsebool container_manage_cgroup
+          changed_when: false
+          register: _sebool
+          when: _selinux.stdout | default('') == 'Enforcing'
+          ignore_errors: true
+
+        - name: Display SELinux info
+          ansible.builtin.debug:
+            msg: >-
+              SELinux: {{ _selinux.stdout | default('disabled') }}.
+              {% if _selinux.stdout | default('') == 'Enforcing' %}
+              If the build fails with 'permission denied', check:
+                ausearch -m avc -ts recent | grep container
+              Container volume mounts use ':z' for automatic relabeling.
+              {% endif %}
+          when: _selinux.stdout | default('') == 'Enforcing'
+
+        - name: Check podman socket exists
+          ansible.builtin.stat:
+            path: "/run/user/{{ ansible_user_uid }}/podman/podman.sock"
+          register: _podman_sock
+
+        - name: Assert podman socket is available
+          ansible.builtin.assert:
+            that:
+              - _podman_sock.stat.exists
+            fail_msg: >-
+              Podman socket not found at /run/user/{{ ansible_user_uid }}/podman/podman.sock.
+              Ensure podman is running in rootless mode:
+                systemctl --user enable --now podman.socket
+
+        - name: Check controller containers are running
+          ansible.builtin.command:
+            cmd: podman ps --format '{{ '{{' }}.Names{{ '}}' }}' --filter name=automation-controller
+          changed_when: false
+          register: _controllers
+
+        - name: Assert at least one controller container is running
+          ansible.builtin.assert:
+            that:
+              - "'automation-controller-web' in _controllers.stdout"
+            fail_msg: >-
+              automation-controller-web is not running.
+              The controller must be running to detect the base image.
+              Start it first: systemctl --user start automation-controller-web
+
+        - name: Check controller venv python is functional
+          ansible.builtin.command:
+            cmd: >-
+              podman exec automation-controller-web
+              /var/lib/awx/venv/awx/bin/python3 -c "import importlib.metadata; print('OK')"
+          changed_when: false
+          register: _venv_check
+
+        - name: Assert controller venv is healthy
+          ansible.builtin.assert:
+            that:
+              - _venv_check.stdout == 'OK'
+            fail_msg: >-
+              The AWX Python venv is not functional. The controller image
+              may be corrupted. Try reverting to stock first:
+                ansible-playbook switch-controller-image.yml -e image_tag=stock
+
+        - name: Check disk space for image build
+          ansible.builtin.shell: df -BM --output=avail {{ ansible_user_dir }} | tail -1 | tr -d ' M'
+          changed_when: false
+          register: _disk_avail
+
+        - name: Assert sufficient disk space (2GB minimum)
+          ansible.builtin.assert:
+            that:
+              - _disk_avail.stdout | int >= 2048
+            fail_msg: >-
+              Only {{ _disk_avail.stdout }}MB available in {{ ansible_user_dir }}.
+              At least 2GB free space is needed for the image build.
+
+        - name: Check plugin source files are present and readable
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ plugin_source }}/pyproject.toml"
+            - "{{ plugin_source }}/Containerfile"
+            - "{{ plugin_source }}/src/beyondtrust_credential_plugin/__init__.py"
+            - "{{ plugin_source }}/src/beyondtrust_credential_plugin/plugin.py"
+          register: _source_files
+
+        - name: Assert all plugin source files exist
+          ansible.builtin.assert:
+            that:
+              - item.stat.exists
+              - item.stat.readable
+            fail_msg: "Missing or unreadable: {{ item.item }}"
+          loop: "{{ _source_files.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: Verify plugin Python syntax
+          ansible.builtin.command:
+            cmd: >-
+              python3 -c "import ast; ast.parse(open('{{ plugin_source }}/src/beyondtrust_credential_plugin/plugin.py').read())"
+          changed_when: false
+
+        - name: Pre-checks passed
+          ansible.builtin.debug:
+            msg: "All pre-flight checks passed. Proceeding with build and install."
+
+    # ==================================================================
+    # BUILD
+    # ==================================================================
+    - name: Detect base controller image
+      ansible.builtin.command:
+        cmd: podman inspect automation-controller-web --format '{{ '{{' }}.ImageName{{ '}}' }}'
+      changed_when: false
+      register: _base_image
+
+    - name: Tag stock image for rollback
+      block:
+        - name: Check if stock tag exists
+          ansible.builtin.command:
+            cmd: podman images localhost/controller-rhel9:stock --format '{{ '{{' }}.ID{{ '}}' }}'
+          changed_when: false
+          register: _stock_exists
+
+        - name: Get current image ID
+          ansible.builtin.command:
+            cmd: podman inspect automation-controller-web --format '{{ '{{' }}.Image{{ '}}' }}'
+          changed_when: false
+          register: _current_id
+          when: _stock_exists.stdout | length == 0
+
+        - name: Tag current image as stock
+          ansible.builtin.command:
+            cmd: "podman tag {{ _current_id.stdout[:12] }} localhost/controller-rhel9:stock"
+          when: _stock_exists.stdout | length == 0
+          changed_when: true
+
+    - name: Ensure source file permissions are correct for build
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: 'u=rw,g=r,o=r'
+      loop:
+        - "{{ plugin_source }}/pyproject.toml"
+        - "{{ plugin_source }}/src/beyondtrust_credential_plugin/__init__.py"
+        - "{{ plugin_source }}/src/beyondtrust_credential_plugin/plugin.py"
+
+    - name: Ensure source directories are traversable
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: 'u=rwx,g=rx,o=rx'
+      loop:
+        - "{{ plugin_source }}/src"
+        - "{{ plugin_source }}/src/beyondtrust_credential_plugin"
+
+    - name: Build custom controller image
+      containers.podman.podman_image:
+        name: localhost/controller-rhel9
+        tag: beyondtrust
+        path: "{{ plugin_source }}"
+        build:
+          file: "{{ plugin_source }}/Containerfile"
+          extra_args: "--build-arg BASE_IMAGE={{ _base_image.stdout }}"
+        force: "{{ force_rebuild | bool }}"
+      register: _build
+
+    - name: Display build result
+      ansible.builtin.debug:
+        msg: "Image built: localhost/controller-rhel9:beyondtrust"
+
+    # ==================================================================
+    # DEPLOY
+    # ==================================================================
+    - name: Import switch-controller-image tasks
+      ansible.builtin.include_tasks:
+        file: "{{ playbook_dir }}/switch-controller-tasks.yml"
+      vars:
+        image_tag: beyondtrust
+        controller_image: "localhost/controller-rhel9:beyondtrust"
+
+    # ==================================================================
+    # FINAL VERIFICATION
+    # ==================================================================
+    - name: Verify plugin is loadable in new container
+      ansible.builtin.command:
+        cmd: >-
+          podman exec automation-controller-web /var/lib/awx/venv/awx/bin/python3 -c
+          "import importlib.metadata;
+          eps = importlib.metadata.entry_points().select(group='awx_plugins.credentials');
+          bt = [ep for ep in eps if 'beyondtrust' in ep.name];
+          assert bt, 'Plugin entry point not found';
+          obj = bt[0].load();
+          print(obj.name)"
+      changed_when: false
+      register: _plugin_verify
+
+    - name: Assert plugin loaded successfully
+      ansible.builtin.assert:
+        that:
+          - "'BeyondTrust' in _plugin_verify.stdout"
+        fail_msg: "Plugin failed to load: {{ _plugin_verify.stderr }}"
+        success_msg: "Plugin loaded: {{ _plugin_verify.stdout }}"
+
+    - name: Installation complete
+      ansible.builtin.debug:
+        msg: |
+          BeyondTrust Password Safe credential plugin installed successfully.
+
+          The 'BeyondTrust Password Safe Lookup' credential type is now
+          available in the AAP UI under Resources -> Credentials -> Add.
+
+          To uninstall:
+            ansible-playbook switch-controller-image.yml -e image_tag=stock

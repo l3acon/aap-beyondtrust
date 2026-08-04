@@ -16,72 +16,85 @@ When a job template runs, AAP resolves linked credential fields server-side befo
 
 ## Deployment
 
-Credential plugins run inside the **controller's Django process**, not in an Execution Environment. The plugin must be baked into a custom controller container image.
+Credential plugins run inside the **controller's Django process**, not in an Execution Environment. The plugin must be baked into a custom controller container image. Only the controller containers are modified — the gateway, hub, EDA, and database containers remain untouched.
 
-### 1. Identify your base controller image
+### Quick start (one command)
 
-On the AAP host, find the current controller image:
-
-```bash
-podman ps --format '{{.Names}} {{.Image}}' | grep controller
-```
-
-Update the `ARG BASE_IMAGE` in the `Containerfile` if it differs from the default.
-
-### 2. Build the custom image
-
-Clone this repo onto your AAP controller host and build:
+Clone this repo onto the AAP controller host and run:
 
 ```bash
 git clone https://github.com/l3acon/aap-beyondtrust.git
 cd aap-beyondtrust
-podman build -t <your-controller-image>:latest .
+ansible-playbook install-plugin.yml
 ```
 
-To deploy in-place (tagging over the existing image so containers pick it up on recreate):
+This will validate your environment, build the custom image, switch the controller, and register the credential type. To uninstall:
 
 ```bash
-podman build -t $(podman inspect automation-controller-web --format '{{.ImageName}}') .
+ansible-playbook switch-controller-image.yml -e image_tag=stock
 ```
 
-### 3. Recreate the controller containers
+### Manual steps
 
-The controller runs as three containers managed by systemd user units: `automation-controller-web`, `automation-controller-task`, and `automation-controller-rsyslog`.
+### In-Place Tag Replacement
 
-After building the new image, recreate the containers so they use it:
+This approach builds the custom image and tags it with the same name as the original controller image. When the containers are recreated, they pick up the new image automatically.
+
+#### 1. Identify your base controller image
 
 ```bash
-# Stop the containers
-systemctl --user stop automation-controller-web automation-controller-task automation-controller-rsyslog
-
-# Remove old containers
-podman rm automation-controller-web automation-controller-task automation-controller-rsyslog
-
-# Re-run the AAP installer to recreate them with the new image
-cd ~/aap27-bundle  # or wherever your installer bundle lives
-ansible-playbook -i inventory collections/ansible_collections/ansible/containerized_installer/playbooks/install.yml
+podman ps --format '{{.Names}} {{.Image}}' | grep controller | grep -v eda
 ```
 
-Alternatively, if the installer is unavailable or has connectivity issues, you can restart via systemd after tagging the new image over the old one:
+Example output:
+```
+automation-controller-web quay.io/aap/ansible-automation-platform-27-next/controller-rhel9:latest
+```
+
+#### 2. Save the stock image for rollback
 
 ```bash
-podman build -t $(podman inspect automation-controller-web --format '{{.ImageName}}') .
+CONTROLLER_IMAGE=$(podman inspect automation-controller-web --format '{{.ImageName}}')
+STOCK_ID=$(podman inspect automation-controller-web --format '{{.Image}}' | head -c 12)
+podman tag $STOCK_ID localhost/controller-rhel9:stock
+```
+
+#### 3. Build and tag the custom image
+
+Clone this repo onto the AAP controller host:
+
+```bash
+git clone https://github.com/l3acon/aap-beyondtrust.git
+cd aap-beyondtrust
+podman build -t $CONTROLLER_IMAGE .
+podman tag $CONTROLLER_IMAGE localhost/controller-rhel9:beyondtrust
+```
+
+#### 4. Recreate the controller containers
+
+Stop, remove, and recreate the three controller containers:
+
+```bash
 podman stop automation-controller-web automation-controller-task automation-controller-rsyslog
 podman rm automation-controller-web automation-controller-task automation-controller-rsyslog
-# Then re-run the installer, or recreate containers manually
 ```
 
-### 4. Register the credential type
+Then re-run the AAP installer to recreate them:
 
-Once the controller containers are running with the new image:
+```bash
+cd ~/aap-containerized-installer  # your installer bundle location
+ansible-playbook -i inventory install.yml
+```
+
+If the installer has connectivity issues (common in air-gapped environments), see [Recreating containers without the installer](#recreating-containers-without-the-installer) below.
+
+#### 5. Register the credential type
 
 ```bash
 podman exec automation-controller-web awx-manage setup_managed_credential_types
 ```
 
-### 5. Verify
-
-Confirm the plugin is registered:
+#### 6. Verify
 
 ```bash
 podman exec automation-controller-web awx-manage shell -c "
@@ -94,6 +107,30 @@ print(f'{ct.name} (ID={ct.id}, kind={ct.kind})')
 Expected output:
 ```
 BeyondTrust Password Safe Lookup (ID=33, kind=external)
+```
+
+### Switching images with the playbook
+
+This repo includes a playbook (`switch-controller-image.yml`) that handles stopping, removing, and recreating the controller containers with a specified image tag. It does not require the full AAP installer or network access to registries.
+
+To switch to the BeyondTrust image:
+
+```bash
+ansible-playbook switch-controller-image.yml -e image_tag=beyondtrust
+```
+
+To roll back to the stock image:
+
+```bash
+ansible-playbook switch-controller-image.yml -e image_tag=stock
+```
+
+The playbook uses locally-tagged images (`localhost/controller-rhel9:<tag>`). The initial build step (step 3 above) creates the `beyondtrust` tag, and step 2 creates the `stock` tag.
+
+After switching to `beyondtrust`, register the credential type:
+
+```bash
+podman exec automation-controller-web awx-manage setup_managed_credential_types
 ```
 
 ## Usage
@@ -136,9 +173,15 @@ aap-beyondtrust/
 ├── README.md
 ├── RESEARCH.md                                 # Design decisions and background research
 ├── Containerfile                               # Extends the AAP controller image
+├── install-plugin.yml                          # One-command install (build + deploy)
+├── build-plugin-image.yml                      # Build image only (no deploy)
+├── switch-controller-image.yml                 # Switch between stock/beyondtrust images
+├── switch-controller-tasks.yml                 # Shared tasks for container recreation
 ├── pyproject.toml                              # Package config + entry points
 ├── .dockerignore
 ├── .gitignore
+├── docs/
+│   └── oidc-auth-mapping-investigation.md      # Auth mapping regression investigation
 └── src/
     └── beyondtrust_credential_plugin/
         ├── __init__.py
@@ -206,6 +249,16 @@ Common issues:
 - **HTTP 403** — API user doesn't have permission for the requested account
 - **Connection refused** — network connectivity from the controller container to BeyondTrust
 - **Timeout** — BeyondTrust is unreachable or the request is pending approval (auto-approve not configured)
+
+### Authentication mapping stops working after install
+
+This plugin only modifies the **controller** containers. Authentication and permission mapping (OIDC, SAML, LDAP) is handled by the **gateway** container, which is never touched. If auth mappings break after installing this plugin, check:
+
+1. Confirm the gateway container was not inadvertently restarted or recreated
+2. Verify authenticator maps are still present: `curl -u admin:<pass> https://localhost/api/gateway/v1/authenticator_maps/`
+3. Ensure the controller was fully online before the next OIDC login attempt (the gateway syncs user attributes with the controller post-auth)
+
+See [docs/oidc-auth-mapping-investigation.md](docs/oidc-auth-mapping-investigation.md) for a detailed investigation of this scenario.
 
 ## References
 

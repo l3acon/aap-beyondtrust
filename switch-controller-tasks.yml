@@ -1,0 +1,149 @@
+---
+# switch-controller-tasks.yml
+#
+# Includable task file that handles stopping, removing, and recreating
+# the controller containers with a given image. Used by both
+# switch-controller-image.yml and install-plugin.yml.
+#
+# Required variables:
+#   controller_image: full image reference (e.g. localhost/controller-rhel9:beyondtrust)
+#   image_tag: short tag name for display (e.g. beyondtrust, stock)
+
+- name: "Set container configuration variables"
+  ansible.builtin.set_fact:
+    _uid: "{{ ansible_user_uid | default(lookup('pipe', 'id -u')) }}"
+    _home: "{{ ansible_user_dir | default(lookup('env', 'HOME')) }}"
+
+- name: "Set path variables"
+  ansible.builtin.set_fact:
+    _aap_dir: "{{ _home }}/aap"
+    _controller_containers:
+      - automation-controller-rsyslog
+      - automation-controller-task
+      - automation-controller-web
+
+- name: "Set volume variables"
+  ansible.builtin.set_fact:
+    _common_secrets:
+      - "controller_secret_key,target=/etc/tower/SECRET_KEY,mode=0400,uid={{ _uid }}"
+      - "controller_channels,target=/etc/tower/conf.d/channels.py,mode=0400,uid={{ _uid }}"
+      - "controller_postgres,target=/etc/tower/conf.d/postgres.py,mode=0400,uid={{ _uid }}"
+      - "controller_resource_server,type=env,target=AWX_RESOURCE_SERVER__SECRET_KEY"
+    _common_volumes:
+      - "{{ _aap_dir }}/tls/extracted:/etc/pki/ca-trust/extracted:z"
+      - "{{ _aap_dir }}/controller/etc/settings.py:/etc/tower/settings.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/callback_receiver_workers.py:/etc/tower/conf.d/callback_receiver_workers.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/cluster_host_id.py:/etc/tower/conf.d/cluster_host_id.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/container_groups.py:/etc/tower/conf.d/container_groups.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/execution_environments.py:/etc/tower/conf.d/execution_environments.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/insights.py:/etc/tower/conf.d/insights.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/redis.py:/etc/tower/conf.d/redis.py:ro,z"
+      - "{{ _aap_dir }}/controller/etc/conf.d/subscription_usage_model.py:/etc/tower/conf.d/subscription_usage_model.py:ro,z"
+    _service_volumes:
+      - "{{ _aap_dir }}/controller/data/job_execution:{{ _aap_dir }}/controller/data/job_execution:z"
+      - "{{ _aap_dir }}/controller/data/job_status:{{ _aap_dir }}/controller/data/job_status:z"
+      - "{{ _aap_dir }}/controller/data/logs:/var/log/tower:z"
+      - "{{ _aap_dir }}/controller/data/projects:{{ _aap_dir }}/controller/data/projects:z"
+      - "{{ _aap_dir }}/controller/data/rsyslog:/var/lib/awx/rsyslog:z"
+      - "{{ _aap_dir }}/controller/etc/launch_awx_task.sh:/usr/bin/launch_awx_task.sh:ro,z"
+      - "{{ _aap_dir }}/receptor/etc/receptor.conf:/etc/receptor/receptor.conf:ro,z"
+      - "receptor_run:/run/receptor:U"
+      - "redis_run:/run/redis:U"
+      - "{{ _aap_dir }}/controller/rsyslog/run:/run/awx-rsyslog:z"
+      - "{{ _aap_dir }}/controller/supervisor/run:/run/supervisor:z"
+    _nginx_volumes:
+      - "{{ _aap_dir }}/controller/etc/uwsgi.ini:/etc/tower/uwsgi.ini:ro,z"
+      - "{{ _aap_dir }}/controller/nginx/etc/controller.conf:/etc/nginx/nginx.conf:ro,z"
+      - "controller_nginx:/var/lib/nginx:U"
+    _podman_volumes:
+      - "{{ _home }}/aap/containers/podman:/usr/bin/podman:ro,z"
+      - "/run/user/{{ _uid }}/podman/podman.sock:/run/user/{{ _uid }}/podman/podman.sock:z"
+    _tls_volumes:
+      - "{{ _aap_dir }}/controller/etc/tower.cert:/etc/tower/tower.cert:ro,z"
+      - "{{ _aap_dir }}/controller/etc/tower.key:/etc/tower/tower.key:ro,z"
+
+- name: "Stop controller containers"
+  containers.podman.podman_container:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ _controller_containers }}"
+  ignore_errors: true
+
+- name: "Remove controller containers"
+  containers.podman.podman_container:
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ _controller_containers }}"
+
+- name: "Create rsyslog container"
+  containers.podman.podman_container:
+    name: automation-controller-rsyslog
+    image: "{{ controller_image }}"
+    command: /usr/bin/launch_awx_rsyslog.sh
+    user: "{{ _uid }}"
+    userns: keep-id
+    network: host
+    secrets: "{{ _common_secrets }}"
+    volume: "{{ _common_volumes + _service_volumes }}"
+    env:
+      SUPERVISOR_CONFIG_PATH: /etc/supervisord_rsyslog.conf
+    state: created
+
+- name: "Create task container"
+  containers.podman.podman_container:
+    name: automation-controller-task
+    image: "{{ controller_image }}"
+    command: /usr/bin/launch_awx_task.sh
+    user: "{{ _uid }}"
+    userns: keep-id
+    network: host
+    secrets: "{{ _common_secrets }}"
+    volume: "{{ _common_volumes + _service_volumes + _podman_volumes }}"
+    security_opt: ['label=disable']
+    env:
+      CONTAINER_HOST: "unix://run/user/{{ _uid }}/podman/podman.sock"
+      SUPERVISOR_CONFIG_PATH: /etc/supervisord_task.conf
+    state: created
+
+- name: "Create web container"
+  containers.podman.podman_container:
+    name: automation-controller-web
+    image: "{{ controller_image }}"
+    command: /usr/bin/launch_awx_web.sh
+    user: "{{ _uid }}"
+    userns: keep-id
+    network: host
+    mount:
+      - 'type=tmpfs,destination=/run/nginx,U=true'
+      - 'type=tmpfs,destination=/run/uwsgi,U=true'
+    secrets: "{{ _common_secrets }}"
+    volume: "{{ _common_volumes + _service_volumes + _nginx_volumes + _tls_volumes }}"
+    stop_timeout: 30
+    env:
+      SUPERVISOR_CONFIG_PATH: /etc/supervisord_web.conf
+    state: created
+
+- name: "Start controller containers"
+  containers.podman.podman_container:
+    name: "{{ item }}"
+    state: started
+  loop: "{{ _controller_containers }}"
+
+- name: "Wait for controller to initialize"
+  ansible.builtin.pause:
+    seconds: 10
+
+- name: "Register credential types (beyondtrust only)"
+  ansible.builtin.command:
+    cmd: podman exec automation-controller-web awx-manage setup_managed_credential_types
+  when: image_tag == 'beyondtrust'
+  changed_when: true
+
+- name: "Verify controller health"
+  ansible.builtin.command:
+    cmd: podman exec automation-controller-web awx-manage check
+  changed_when: false
+  retries: 3
+  delay: 5
+  register: _health
+  until: _health.rc == 0

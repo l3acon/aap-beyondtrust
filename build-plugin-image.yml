@@ -1,0 +1,254 @@
+---
+# build-plugin-image.yml
+#
+# Builds the custom controller image with the BeyondTrust credential plugin
+# and tags it for use with switch-controller-image.yml.
+#
+# Usage:
+#   ansible-playbook build-plugin-image.yml
+#
+# Optional variables:
+#   -e plugin_source=/path/to/aap-beyondtrust   (default: directory containing this playbook)
+#   -e force_rebuild=true                        (rebuild even if image already exists)
+#
+# Prerequisites:
+#   - Must be run on the AAP controller host as the AAP service user
+#   - Podman must be installed and functional
+#   - The AAP controller containers must be running (to detect the base image)
+
+- name: Build BeyondTrust credential plugin image
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    plugin_source: "{{ playbook_dir }}"
+    force_rebuild: false
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Pre-flight checks
+    # ------------------------------------------------------------------
+    - name: Pre-flight checks
+      block:
+        - name: Check podman is installed
+          ansible.builtin.command:
+            cmd: podman --version
+          changed_when: false
+          register: _podman_version
+
+        - name: Display podman version
+          ansible.builtin.debug:
+            msg: "{{ _podman_version.stdout }}"
+
+        - name: Check SELinux status
+          ansible.builtin.command:
+            cmd: getenforce
+          changed_when: false
+          register: _selinux_status
+          ignore_errors: true
+
+        - name: Warn if SELinux is enforcing
+          ansible.builtin.debug:
+            msg: >-
+              SELinux is {{ _selinux_status.stdout | default('unknown') }}.
+              Container volume mounts use ':z' relabeling to handle this.
+              If builds fail with permission denied, check SELinux audit log:
+              ausearch -m avc -ts recent
+          when: _selinux_status.stdout | default('') == 'Enforcing'
+
+        - name: Check current umask
+          ansible.builtin.shell: umask
+          changed_when: false
+          register: _umask
+
+        - name: Assert umask allows read/execute for group/other
+          ansible.builtin.assert:
+            that:
+              - _umask.stdout | int <= 27
+            fail_msg: >-
+              Current umask is {{ _umask.stdout }} which is too restrictive.
+              Files created during the build will not be readable inside the container.
+              The AWX venv requires at least 0022 (or 0027) umask.
+              Set umask before running: umask 0022
+            success_msg: "umask {{ _umask.stdout }} is acceptable"
+
+        - name: Check plugin source directory exists
+          ansible.builtin.stat:
+            path: "{{ plugin_source }}/pyproject.toml"
+          register: _pyproject
+
+        - name: Assert plugin source is valid
+          ansible.builtin.assert:
+            that:
+              - _pyproject.stat.exists
+            fail_msg: >-
+              Cannot find pyproject.toml at {{ plugin_source }}/pyproject.toml.
+              Set plugin_source to the directory containing the plugin code.
+
+        - name: Check Containerfile exists
+          ansible.builtin.stat:
+            path: "{{ plugin_source }}/Containerfile"
+          register: _containerfile
+
+        - name: Assert Containerfile exists
+          ansible.builtin.assert:
+            that:
+              - _containerfile.stat.exists
+            fail_msg: "Cannot find {{ plugin_source }}/Containerfile"
+
+        - name: Check plugin Python source is readable
+          ansible.builtin.command:
+            cmd: "python3 -c \"import ast; ast.parse(open('{{ plugin_source }}/src/beyondtrust_credential_plugin/plugin.py').read())\""
+          changed_when: false
+          register: _syntax_check
+
+        - name: Assert plugin Python syntax is valid
+          ansible.builtin.assert:
+            that:
+              - _syntax_check.rc == 0
+            fail_msg: "Plugin source has syntax errors: {{ _syntax_check.stderr }}"
+
+    # ------------------------------------------------------------------
+    # Detect base image
+    # ------------------------------------------------------------------
+    - name: Detect base controller image
+      block:
+        - name: Check if controller containers are running
+          ansible.builtin.command:
+            cmd: podman ps --format '{{ '{{' }}.Names{{ '}}' }}' --filter name=automation-controller-web
+          changed_when: false
+          register: _running_containers
+
+        - name: Get base image from running container
+          ansible.builtin.command:
+            cmd: podman inspect automation-controller-web --format '{{ '{{' }}.ImageName{{ '}}' }}'
+          changed_when: false
+          register: _current_image
+          when: _running_containers.stdout | length > 0
+
+        - name: Get base image from local stock tag
+          ansible.builtin.command:
+            cmd: podman images localhost/controller-rhel9:stock --format '{{ '{{' }}.ID{{ '}}' }}'
+          changed_when: false
+          register: _stock_image_id
+          when: _running_containers.stdout | length == 0
+
+        - name: Set base image fact (from running container)
+          ansible.builtin.set_fact:
+            base_image: "{{ _current_image.stdout }}"
+          when:
+            - _running_containers.stdout | length > 0
+            - _current_image.stdout | default('') | length > 0
+
+        - name: Set base image fact (from stock tag)
+          ansible.builtin.set_fact:
+            base_image: "localhost/controller-rhel9:stock"
+          when:
+            - _running_containers.stdout | length == 0
+            - _stock_image_id.stdout | default('') | length > 0
+
+        - name: Assert base image was detected
+          ansible.builtin.assert:
+            that:
+              - base_image is defined
+              - base_image | length > 0
+            fail_msg: >-
+              Cannot determine the base controller image.
+              Either run this with the controller containers running,
+              or ensure localhost/controller-rhel9:stock is tagged.
+
+        - name: Display base image
+          ansible.builtin.debug:
+            msg: "Base image: {{ base_image }}"
+
+    # ------------------------------------------------------------------
+    # Check if rebuild is needed
+    # ------------------------------------------------------------------
+    - name: Check if beyondtrust image already exists
+      ansible.builtin.command:
+        cmd: podman images localhost/controller-rhel9:beyondtrust --format '{{ '{{' }}.ID{{ '}}' }}'
+      changed_when: false
+      register: _existing_bt_image
+
+    - name: Skip build if image exists and force_rebuild is false
+      ansible.builtin.debug:
+        msg: >-
+          Image localhost/controller-rhel9:beyondtrust already exists ({{ _existing_bt_image.stdout }}).
+          Use -e force_rebuild=true to rebuild.
+      when:
+        - _existing_bt_image.stdout | length > 0
+        - not force_rebuild | bool
+
+    # ------------------------------------------------------------------
+    # Build the image
+    # ------------------------------------------------------------------
+    - name: Build custom controller image
+      when: _existing_bt_image.stdout | length == 0 or force_rebuild | bool
+      block:
+        - name: Ensure source files have correct permissions for container build
+          ansible.builtin.file:
+            path: "{{ item }}"
+            mode: 'u=rw,g=r,o=r'
+          loop:
+            - "{{ plugin_source }}/pyproject.toml"
+            - "{{ plugin_source }}/src/beyondtrust_credential_plugin/__init__.py"
+            - "{{ plugin_source }}/src/beyondtrust_credential_plugin/plugin.py"
+
+        - name: Ensure source directories are traversable
+          ansible.builtin.file:
+            path: "{{ item }}"
+            mode: 'u=rwx,g=rx,o=rx'
+          loop:
+            - "{{ plugin_source }}/src"
+            - "{{ plugin_source }}/src/beyondtrust_credential_plugin"
+
+        - name: Build the image
+          containers.podman.podman_image:
+            name: localhost/controller-rhel9
+            tag: beyondtrust
+            path: "{{ plugin_source }}"
+            build:
+              file: "{{ plugin_source }}/Containerfile"
+              extra_args: "--build-arg BASE_IMAGE={{ base_image }}"
+            force: "{{ force_rebuild | bool }}"
+          register: _build_result
+
+        - name: Display build result
+          ansible.builtin.debug:
+            msg: "Image built: {{ _build_result.image.Id[:12] }}"
+
+    # ------------------------------------------------------------------
+    # Tag stock image for rollback
+    # ------------------------------------------------------------------
+    - name: Tag stock image if not already tagged
+      when: _stock_image_id is skipped or _stock_image_id.stdout | default('') | length == 0
+      block:
+        - name: Get current controller image ID
+          ansible.builtin.command:
+            cmd: podman inspect automation-controller-web --format '{{ '{{' }}.Image{{ '}}' }}'
+          changed_when: false
+          register: _controller_image_id
+          ignore_errors: true
+
+        - name: Tag as stock
+          ansible.builtin.command:
+            cmd: "podman tag {{ _controller_image_id.stdout[:12] }} localhost/controller-rhel9:stock"
+          when: _controller_image_id.rc == 0
+          changed_when: true
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          Build complete. Available images:
+            localhost/controller-rhel9:stock        - Original Red Hat image
+            localhost/controller-rhel9:beyondtrust  - With BeyondTrust plugin
+
+          To deploy the plugin:
+            ansible-playbook switch-controller-image.yml -e image_tag=beyondtrust
+
+          To roll back:
+            ansible-playbook switch-controller-image.yml -e image_tag=stock
