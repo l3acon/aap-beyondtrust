@@ -1,19 +1,17 @@
-import collections
 import logging
-import threading
-import time
 
-logger = logging.getLogger(__name__)
-
-CredentialPlugin = collections.namedtuple(
-    "CredentialPlugin", ["name", "inputs", "backend"]
+from ._common import (
+    CredentialPlugin,
+    create_session,
+    get_cached,
+    handle_request_error,
+    set_cache,
+    sign_in,
+    sign_out,
+    str_to_bool,
 )
 
-# Short-lived cache to avoid redundant API calls when multiple fields
-# (e.g. username + password) are resolved from the same managed account.
-_cache = {}
-_cache_lock = threading.Lock()
-_CACHE_TTL_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 beyondtrust_inputs = {
     "fields": [
@@ -74,45 +72,13 @@ beyondtrust_inputs = {
 }
 
 
-def _str_to_bool(value):
-    """AWX may pass boolean fields as strings from the UI."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.lower() not in ("false", "0", "no", "")
-    return bool(value)
-
-
-def _get_cached(system_name, account_name):
-    """Return cached credential if still valid, else None."""
-    key = (system_name, account_name)
-    with _cache_lock:
-        entry = _cache.get(key)
-        if entry and (time.time() - entry["ts"]) < _CACHE_TTL_SECONDS:
-            return entry["value"]
-        _cache.pop(key, None)
-    return None
-
-
-def _set_cache(system_name, account_name, value):
-    key = (system_name, account_name)
-    with _cache_lock:
-        _cache[key] = {"value": value, "ts": time.time()}
-
-
 def beyondtrust_backend(**kwargs):
-    try:
-        import requests
-    except ImportError as e:
-        raise ValueError(
-            "The requests package is not installed. "
-            "Install it with: pip install requests"
-        ) from e
+    import requests
 
     url = kwargs["url"].rstrip("/")
     api_key = kwargs["api_key"]
     api_user = kwargs["api_user"]
-    verify_ssl = _str_to_bool(kwargs.get("verify_ssl", True))
+    verify_ssl = str_to_bool(kwargs.get("verify_ssl", True))
     system_name = kwargs["system_name"]
     account_name = kwargs["account_name"]
 
@@ -121,26 +87,15 @@ def beyondtrust_backend(**kwargs):
     except (ValueError, TypeError):
         request_duration = 1
 
-    cached = _get_cached(system_name, account_name)
+    cached = get_cached("ps", system_name, account_name)
     if cached is not None:
         return cached
 
-    session = requests.Session()
-    session.verify = verify_ssl
-    session.headers.update(
-        {
-            "Content-Type": "application/json",
-            "Authorization": f"PS-Auth key={api_key}; runas={api_user};",
-        }
-    )
+    session = create_session(url, api_key, api_user, verify_ssl)
 
-    request_id = None
     try:
-        # Step 1: Authenticate
-        resp = session.post(f"{url}/Auth/SignAppin", timeout=30)
-        resp.raise_for_status()
+        sign_in(session, url)
 
-        # Step 2: Find managed account
         resp = session.get(
             f"{url}/ManagedAccounts",
             params={"systemName": system_name, "accountName": account_name},
@@ -156,7 +111,6 @@ def beyondtrust_backend(**kwargs):
         account_id = accounts[0]["AccountId"]
         system_id = accounts[0]["SystemId"]
 
-        # Step 3: Request credential checkout
         resp = session.post(
             f"{url}/Requests",
             json={
@@ -170,12 +124,10 @@ def beyondtrust_backend(**kwargs):
         resp.raise_for_status()
         request_id = resp.json()
 
-        # Step 4: Retrieve the credential
         resp = session.get(f"{url}/Credentials/{request_id}", timeout=30)
         resp.raise_for_status()
         credential_value = resp.text.strip('"')
 
-        # Step 5: Check in the request
         try:
             session.put(f"{url}/Requests/{request_id}/Checkin", timeout=30)
         except Exception:
@@ -185,30 +137,18 @@ def beyondtrust_backend(**kwargs):
                 request_duration,
             )
 
-        _set_cache(system_name, account_name, credential_value)
+        set_cache(credential_value, "ps", system_name, account_name)
         return credential_value
 
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "unknown"
-        raise ValueError(
-            f"BeyondTrust API error (HTTP {status}): {e}"
-        ) from e
-
-    except requests.exceptions.ConnectionError as e:
-        raise ValueError(
-            f"Cannot connect to BeyondTrust at {url}: {e}"
-        ) from e
-
-    except requests.exceptions.Timeout as e:
-        raise ValueError(
-            f"BeyondTrust API request timed out: {e}"
-        ) from e
+    except (
+        requests.exceptions.HTTPError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    ) as e:
+        handle_request_error(e, url)
 
     finally:
-        try:
-            session.post(f"{url}/Auth/Signout", timeout=10)
-        except Exception:
-            pass
+        sign_out(session, url)
 
 
 beyondtrust_plugin = CredentialPlugin(
