@@ -267,6 +267,8 @@ Rather than raw HTTP calls, they depend on a vendor-provided Python SDK. BeyondT
 - [awx-plugins-core RTD](https://awx-plugins-core.readthedocs.io/en/latest/credential-plugins/)
 - [OneIdentity Safeguard Credential Plugin](https://github.com/OneIdentity/safeguard-ansible/tree/main/credential_type_plugin) — real-world PAM credential plugin implementation, good reference for patterns and pitfalls
 - [BeyondTrust Password Safe REST API](https://docs.beyondtrust.com/bips/v25.2/docs/api)
+- [BeyondTrust Secrets Safe REST API](https://docs.beyondtrust.com/bips/v25.1/docs/secrets-safe-apis)
+- [BeyondTrust Secrets Safe Ansible Lookup Plugin](https://galaxy.ansible.com/ui/repo/published/beyondtrust/secrets_safe/content/lookup/secrets_safe_lookup/)
 - [AAP 2.7 Image Variables](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.7/install-image_variables)
 - [Derek Waters - Building a Custom Credential Plugin](https://derekwaters.github.io/ansible/execution/environments/credentials/aws/sts/assume/role/2023/12/21/building-a-custom-credential-plugin.html)
 - [Ansible Forum - Custom credential plugins in containerized AAP](https://forum.ansible.com/t/basic-process-to-install-new-awx-credential-plugins-in-awx/37848)

@@ -26,6 +26,8 @@ where = ["src"]
 
 [project.entry-points."awx_plugins.credentials"]
 beyondtrust_password_safe = "beyondtrust_credential_plugin:beyondtrust_plugin"
+beyondtrust_secrets_safe = "beyondtrust_credential_plugin:secrets_safe_plugin"
 
 [project.entry-points."awx.credential_plugins"]
 beyondtrust_password_safe = "beyondtrust_credential_plugin:beyondtrust_plugin"
+beyondtrust_secrets_safe = "beyondtrust_credential_plugin:secrets_safe_plugin"
