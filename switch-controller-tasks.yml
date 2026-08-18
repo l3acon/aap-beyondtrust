@@ -17,10 +17,24 @@
 - name: "Set path variables"
   ansible.builtin.set_fact:
     _aap_dir: "{{ _home }}/aap"
+    _systemd_dir: "{{ _home }}/.config/systemd/user"
     _controller_containers:
       - automation-controller-rsyslog
       - automation-controller-task
       - automation-controller-web
+
+- name: "Detect systemd requires from existing unit files"
+  ansible.builtin.shell:
+    cmd: >-
+      grep -h '^Requires=' {{ _systemd_dir }}/automation-controller-web.service 2>/dev/null
+      | sed 's/Requires=//' | tr ' ' '\n' | sort -u | tr '\n' ' '
+  changed_when: false
+  register: _existing_requires
+
+- name: "Set systemd requires"
+  ansible.builtin.set_fact:
+    _systemd_requires: >-
+      {{ _existing_requires.stdout.split() | default(['postgresql.service', 'redis-unix.service']) }}
 
 - name: "Set volume variables"
   ansible.builtin.set_fact:
@@ -80,6 +94,12 @@
     name: automation-controller-rsyslog
     image: "{{ controller_image }}"
     command: /usr/bin/launch_awx_rsyslog.sh
+    generate_systemd:
+      container_prefix: ''
+      path: "{{ _systemd_dir }}"
+      separator: ''
+      requires: "{{ _systemd_requires }}"
+      restart_policy: always
     user: "{{ _uid }}"
     userns: keep-id
     network: host
@@ -94,6 +114,12 @@
     name: automation-controller-task
     image: "{{ controller_image }}"
     command: /usr/bin/launch_awx_task.sh
+    generate_systemd:
+      container_prefix: ''
+      path: "{{ _systemd_dir }}"
+      separator: ''
+      requires: "{{ _systemd_requires }}"
+      restart_policy: always
     user: "{{ _uid }}"
     userns: keep-id
     network: host
@@ -110,6 +136,12 @@
     name: automation-controller-web
     image: "{{ controller_image }}"
     command: /usr/bin/launch_awx_web.sh
+    generate_systemd:
+      container_prefix: ''
+      path: "{{ _systemd_dir }}"
+      separator: ''
+      requires: "{{ _systemd_requires }}"
+      restart_policy: always
     user: "{{ _uid }}"
     userns: keep-id
     network: host
@@ -122,6 +154,11 @@
     env:
       SUPERVISOR_CONFIG_PATH: /etc/supervisord_web.conf
     state: created
+
+- name: "Reload systemd to pick up regenerated unit files"
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+    scope: user
 
 - name: "Start controller containers"
   containers.podman.podman_container:
