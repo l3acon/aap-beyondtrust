@@ -1,18 +1,17 @@
-# AAP BeyondTrust Password Safe Credential Plugin
+# AAP BeyondTrust Secrets Safe Credential Plugin
 
-A custom credential plugin for Ansible Automation Platform (AAP) 2.7 that retrieves secrets from BeyondTrust Password Safe **at job launch time** on the controller — not during playbook execution on endpoints.
+A custom credential plugin for Ansible Automation Platform (AAP) 2.7 that retrieves secrets from BeyondTrust Secrets Safe **at job launch time** on the controller — not during playbook execution on endpoints.
 
-When a job template runs, AAP resolves linked credential fields server-side before the playbook ever reaches a managed host. This plugin calls the BeyondTrust REST API to check out a credential and returns it to AAP for injection into the job environment.
+When a job template runs, AAP resolves linked credential fields server-side before the playbook ever reaches a managed host. This plugin calls the BeyondTrust REST API to retrieve a secret and returns it to AAP for injection into the job environment.
 
 ## Prerequisites
 
 - AAP 2.7 containerized deployment on RHEL
 - Podman on the controller host
-- Network connectivity from the controller to your BeyondTrust Password Safe API
-- A BeyondTrust API Registration configured for AAP with:
-  - An API key
-  - A RunAs user with permissions to request managed account credentials
-  - Auto-approve policies for the API user (otherwise checkout requests will hang waiting for human approval)
+- Network connectivity from the controller to your BeyondTrust Secrets Safe API
+- A BeyondTrust API Registration configured for AAP with either:
+  - An API key + a RunAs user with permissions to read secrets in the target Secrets Safe folders, or
+  - An OAuth Client ID/Secret with equivalent read permissions
 
 ## Deployment
 
@@ -106,7 +105,7 @@ print(f'{ct.name} (ID={ct.id}, kind={ct.kind})')
 
 Expected output:
 ```
-BeyondTrust Password Safe Lookup (ID=33, kind=external)
+BeyondTrust Secrets Safe Lookup (ID=33, kind=external)
 ```
 
 ### Switching images with the playbook
@@ -135,42 +134,20 @@ podman exec automation-controller-web awx-manage setup_managed_credential_types
 
 ## Usage
 
-This plugin provides two credential types in the AAP UI:
+This plugin provides one credential type in the AAP UI:
 
-- **BeyondTrust Password Safe Lookup** — for managed accounts (checkout/checkin flow)
 - **BeyondTrust Secrets Safe Lookup** — for secrets stored in Secrets Safe folders (direct retrieval)
 
-### Password Safe: Create a source credential
-
-1. In AAP, navigate to **Resources → Credentials → Add**
-2. Select credential type: **BeyondTrust Password Safe Lookup**
-3. Fill in:
-   - **BeyondTrust URL** — base API URL (e.g. `https://bt.example.com/BeyondTrust/api/public/v3`)
-   - **API Key** — the key from your BeyondInsight API Registration
-   - **API User (RunAs)** — the BeyondInsight user to authenticate as
-   - **Verify SSL Certificates** — `true` for production, `false` for lab/self-signed
-   - **Checkout Duration** — how long to hold the checkout (default: 1 minute)
-
-### Password Safe: Link to a target credential
-
-1. Create or edit a target credential (e.g. a **Machine** credential)
-2. Click the key/link icon next to the field you want to populate (e.g. `Password`)
-3. Select your BeyondTrust Password Safe credential as the source
-4. Provide the metadata:
-   - **Managed System Name** — the system name in Password Safe
-   - **Managed Account Name** — the account name to retrieve
-5. Save
-
-### Secrets Safe: Create a source credential
+### Create a source credential
 
 1. In AAP, navigate to **Resources → Credentials → Add**
 2. Select credential type: **BeyondTrust Secrets Safe Lookup**
 3. Fill in:
-   - **BeyondTrust URL** — base API URL (same as Password Safe)
+   - **BeyondTrust URL** — base API URL (e.g. `https://bt.example.com/BeyondTrust/api/public/v3`)
    - **API Key** + **API User** — OR — **OAuth Client ID** + **OAuth Client Secret**
    - **Verify SSL Certificates** — `true` for production, `false` for lab/self-signed
 
-### Secrets Safe: Link to a target credential
+### Link to a target credential
 
 1. Create or edit a target credential (e.g. a **Machine** credential)
 2. Click the key/link icon next to the field you want to populate
@@ -209,32 +186,22 @@ aap-beyondtrust/
 │   └── oidc-auth-mapping-investigation.md      # Auth mapping regression investigation
 └── src/
     └── beyondtrust_credential_plugin/
-        ├── __init__.py                         # Exports both plugins
+        ├── __init__.py                         # Exports the credential plugin
         ├── _common.py                          # Shared auth, cache, and error handling
-        ├── plugin.py                           # Password Safe credential plugin
         └── secrets_safe.py                     # Secrets Safe credential plugin
 ```
 
 ## How It Works
 
-Both plugins share authentication (`POST /Auth/SignAppin`) and a 30-second in-memory cache so that multiple field lookups reuse a single API call.
-
-### Password Safe flow
-
-1. **Authenticate** — `POST /Auth/SignAppin` with API key + RunAs user
-2. **Find account** — `GET /ManagedAccounts?systemName=X&accountName=Y`
-3. **Request checkout** — `POST /Requests` with account ID and duration
-4. **Retrieve credential** — `GET /Credentials/{requestId}`
-5. **Check in** — `PUT /Requests/{requestId}/Checkin`
-6. **Sign out** — `POST /Auth/Signout`
+The plugin authenticates (`POST /Auth/SignAppin`, or an OAuth client-credentials token exchange) and uses a 30-second in-memory cache so that multiple field lookups against the same secret reuse a single API call.
 
 ### Secrets Safe flow
 
-1. **Authenticate** — `POST /Auth/SignAppin` (API key or OAuth)
+1. **Authenticate** — `POST /Auth/SignAppin` (API key + RunAs) or OAuth token exchange
 2. **Retrieve secret** — `GET /Secrets-Safe/Secrets?Path=X&Title=Y&Decrypt=true`
 3. **Sign out** — `POST /Auth/Signout`
 
-Secrets Safe is simpler — no checkout/checkin workflow. Secrets are retrieved directly by folder path and title.
+There is no checkout/checkin workflow — secrets are retrieved directly by folder path and title.
 
 ## Upgrading AAP
 
@@ -267,7 +234,7 @@ else:
 
 If not found, the image wasn't built correctly or the container is still running the old image.
 
-### `KeyError: 'beyondtrust_password_safe'` in controller logs
+### `KeyError: 'beyondtrust_secrets_safe'` in controller logs
 
 The credential type exists in the database but the plugin code is missing from the container. Rebuild and redeploy the custom image.
 
@@ -280,10 +247,10 @@ podman logs automation-controller-task 2>&1 | grep -i beyondtrust
 ```
 
 Common issues:
-- **HTTP 401** — invalid API key or RunAs user
-- **HTTP 403** — API user doesn't have permission for the requested account
+- **HTTP 401** — invalid API key/RunAs user or OAuth client credentials
+- **HTTP 403** — API user doesn't have permission to read the requested secret/folder
 - **Connection refused** — network connectivity from the controller container to BeyondTrust
-- **Timeout** — BeyondTrust is unreachable or the request is pending approval (auto-approve not configured)
+- **Timeout** — BeyondTrust is unreachable, or the secret path/title doesn't resolve
 
 ### Authentication mapping stops working after install
 
@@ -298,7 +265,6 @@ See [docs/oidc-auth-mapping-investigation.md](docs/oidc-auth-mapping-investigati
 ## References
 
 - [AWX Credential Plugins Documentation](https://github.com/ansible/awx/blob/devel/docs/credentials/credential_plugins.md)
-- [BeyondTrust Password Safe REST API](https://docs.beyondtrust.com/bips/v25.2/docs/api)
 - [BeyondTrust Secrets Safe REST API](https://docs.beyondtrust.com/bips/v25.1/docs/secrets-safe-apis)
 - [BeyondTrust Secrets Safe Ansible Lookup Plugin](https://galaxy.ansible.com/ui/repo/published/beyondtrust/secrets_safe/content/lookup/secrets_safe_lookup/)
 - [AAP 2.7 Image Variables](https://docs.redhat.com/en/documentation/red_hat_ansible_automation_platform/2.7/install-image_variables)
