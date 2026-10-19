@@ -6,12 +6,19 @@ When a job template runs, AAP resolves linked credential fields server-side befo
 
 ## Prerequisites
 
-- AAP 2.7 containerized deployment on RHEL
-- Podman on the controller host
+- AAP 2.7 deployed on **RHEL** (containerized) or **OpenShift** (operator-managed)
 - Network connectivity from the controller to your BeyondTrust Secrets Safe API
 - A BeyondTrust API Registration configured for AAP with either:
   - An API key + a RunAs user with permissions to read secrets in the target Secrets Safe folders, or
   - An OAuth Client ID/Secret with equivalent read permissions
+
+### Additional prerequisites by platform
+
+| | RHEL | OpenShift |
+|---|---|---|
+| **Tool** | Podman on the controller host | `oc` CLI logged into the cluster |
+| **Image delivery** | Local podman image store | Container registry accessible to the cluster |
+| **Permissions** | AAP service user (non-root) | Ability to patch `AutomationController` CR |
 
 ## Deployment
 
@@ -132,6 +139,98 @@ After switching to `beyondtrust`, register the credential type:
 podman exec automation-controller-web awx-manage setup_managed_credential_types
 ```
 
+### Deployment on OpenShift (OCP)
+
+On OpenShift, AAP is managed by the **AutomationController operator**. Instead of manipulating podman containers directly, we patch the `AutomationController` custom resource with a custom image reference. The operator handles the rolling update.
+
+#### Deploy AAP on a fresh cluster
+
+Log in with `oc login` using an account with operator installation permissions, then run:
+
+```bash
+ansible-playbook deploy-aap-ocp.yml
+```
+
+Adapted from the `mad-hatter` deployment roles, this installs the AAP operator
+from the `stable-2.7` channel in namespace `aap`, then creates an
+`AnsibleAutomationPlatform` named `aap` with a gateway and controller. Hub, EDA,
+and Lightspeed are disabled for this plugin test environment. The playbook waits
+for both APIs and controller deployments to become ready, then prints the URL and
+command to retrieve the generated admin password. Activate an AAP subscription
+before launching jobs.
+
+Override `aap_namespace`, `aap_name`, or `aap_operator_channel` with `-e` as needed.
+The playbook requires only `ansible-core` and `oc`; it uses the current kubeconfig.
+Use the same kubeconfig for the plugin installation below. Keep credential files
+out of Git and container build contexts.
+
+#### Quick start (one command)
+
+If you have `podman` (or `docker`) locally and are logged into the cluster with `oc`:
+
+```bash
+ansible-playbook install-plugin-ocp.yml \
+  -e custom_image=quay.io/myorg/controller-beyondtrust:latest \
+  -e build_and_push=true
+```
+
+This will detect the base controller image from the running cluster, build the custom image, push it to your registry, patch the CR, wait for the rollout, and register the credential types.
+
+#### Pre-built image
+
+If the image is already in a registry:
+
+```bash
+ansible-playbook install-plugin-ocp.yml \
+  -e custom_image=quay.io/myorg/controller-beyondtrust:latest
+```
+
+#### With a private registry
+
+If your registry requires authentication and the cluster doesn't already have a pull secret:
+
+```bash
+ansible-playbook install-plugin-ocp.yml \
+  -e custom_image=registry.internal.example.com/aap/controller-beyondtrust:latest \
+  -e build_and_push=true \
+  -e create_registry_secret=true \
+  -e registry_server=registry.internal.example.com \
+  -e registry_username=myuser \
+  -e registry_password='<your-registry-password>'
+```
+
+#### Targeting a specific namespace
+
+By default the playbook uses the current `oc project`. To target a different namespace:
+
+```bash
+ansible-playbook install-plugin-ocp.yml \
+  -e custom_image=quay.io/myorg/controller-beyondtrust:latest \
+  -e aap_namespace=my-aap-namespace
+```
+
+#### Rollback
+
+To revert to the stock controller image:
+
+```bash
+ansible-playbook install-plugin-ocp.yml -e rollback=true
+```
+
+This removes the `image` and `image_version` overrides from the
+`AutomationController` CR and waits for both deployments to roll back to the
+operator's default image.
+
+#### How it works (OCP)
+
+1. **Queries** the `AutomationController` CR to discover the current base image
+2. **Builds** a custom image using the same `Containerfile` as RHEL (if `build_and_push=true`)
+3. **Pushes** to the specified registry
+4. **Patches** `spec.image` and `spec.image_version` on the `AutomationController` CR
+5. **Waits** for the operator to apply the requested image and complete both controller rollouts
+6. **Registers** credential types via `awx-manage setup_managed_credential_types`
+7. **Verifies** the plugin entry points are loaded
+
 ## Usage
 
 This plugin provides one credential type in the AAP UI:
@@ -175,10 +274,11 @@ aap-beyondtrust/
 ├── README.md
 ├── RESEARCH.md                                 # Design decisions and background research
 ├── Containerfile                               # Extends the AAP controller image
-├── install-plugin.yml                          # One-command install (build + deploy)
-├── build-plugin-image.yml                      # Build image only (no deploy)
-├── switch-controller-image.yml                 # Switch between stock/beyondtrust images
-├── switch-controller-tasks.yml                 # Shared tasks for container recreation
+├── install-plugin.yml                          # One-command install for RHEL (build + deploy)
+├── install-plugin-ocp.yml                      # One-command install for OpenShift
+├── build-plugin-image.yml                      # Build image only (no deploy, RHEL)
+├── switch-controller-image.yml                 # Switch between stock/beyondtrust images (RHEL)
+├── switch-controller-tasks.yml                 # Shared tasks for container recreation (RHEL)
 ├── pyproject.toml                              # Package config + entry points
 ├── .dockerignore
 ├── .gitignore

@@ -1,3 +1,7 @@
 .git
 *.md
+!README.md
+*.creds*
+.kube/
+.env
 .dockerignore
