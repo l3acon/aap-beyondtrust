@@ -1,0 +1,543 @@
+---
+# install-plugin-ocp.yml
+#
+# Deploy the BeyondTrust credential plugin to AAP on OpenShift/OCP.
+#
+# Builds a custom controller image with the plugin baked in, pushes it
+# to a container registry, and patches the AutomationController CR so
+# the operator rolls out the new image.  No cluster resources are
+# created or deleted manually — the operator handles everything.
+#
+# Usage:
+#   # Image already built & pushed:
+#   ansible-playbook install-plugin-ocp.yml \
+#     -e custom_image=quay.io/myorg/controller-beyondtrust:latest
+#
+#   # Build, push, and deploy in one step:
+#   ansible-playbook install-plugin-ocp.yml \
+#     -e custom_image=quay.io/myorg/controller-beyondtrust:latest \
+#     -e build_and_push=true
+#
+#   # Rollback to stock image:
+#   ansible-playbook install-plugin-ocp.yml -e rollback=true
+#
+# Required variables:
+#   custom_image          Full registry path for the custom image
+#                         (not required when rollback=true)
+#
+# Optional variables:
+#   aap_namespace         Namespace where AAP lives (default: auto-detect from current oc project)
+#   build_and_push        Build & push the image first (default: false)
+#   plugin_source         Path to plugin source tree (default: playbook directory)
+#   container_tool        podman or docker (default: auto-detect)
+#   registry_secret       Name of an existing image pull secret in the namespace
+#   create_registry_secret  Create a pull secret from registry_username/password (default: false)
+#   registry_server       Registry hostname for pull secret (e.g. quay.io)
+#   registry_username     Registry username (used with create_registry_secret)
+#   registry_password     Registry password (used with create_registry_secret)
+#   rollback              Remove image override and revert to stock (default: false)
+#   skip_prechecks        Skip pre-flight checks (default: false)
+#   rollout_timeout       Seconds to wait for deployment rollout (default: 300)
+
+- name: Deploy BeyondTrust credential plugin to AAP on OpenShift
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    plugin_source: "{{ playbook_dir }}"
+    build_and_push: false
+    rollback: false
+    skip_prechecks: false
+    create_registry_secret: false
+    rollout_timeout: 300
+
+  tasks:
+    # ==================================================================
+    # PRE-FLIGHT CHECKS
+    # ==================================================================
+    - name: Pre-flight checks
+      when: not skip_prechecks | bool
+      block:
+        - name: Verify oc CLI is available
+          ansible.builtin.command:
+            cmd: oc version --client
+          changed_when: false
+          register: _oc_version
+
+        - name: Verify oc is logged in
+          ansible.builtin.command:
+            cmd: oc whoami
+          changed_when: false
+          register: _oc_whoami
+
+        - name: Display cluster connection
+          ansible.builtin.debug:
+            msg: "Logged in as {{ _oc_whoami.stdout }}"
+
+    # ==================================================================
+    # DETECT AAP NAMESPACE AND CONTROLLER CR
+    # ==================================================================
+    - name: Detect AAP namespace (from variable or current project)
+      block:
+        - name: Use provided namespace
+          ansible.builtin.set_fact:
+            _namespace: "{{ aap_namespace }}"
+          when: aap_namespace is defined
+
+        - name: Detect current project
+          ansible.builtin.command:
+            cmd: oc project -q
+          changed_when: false
+          register: _current_project
+          when: aap_namespace is not defined
+
+        - name: Set namespace from current project
+          ansible.builtin.set_fact:
+            _namespace: "{{ _current_project.stdout | trim }}"
+          when: aap_namespace is not defined
+
+        - name: Display target namespace
+          ansible.builtin.debug:
+            msg: "Target namespace: {{ _namespace }}"
+
+    - name: Discover AutomationController CR
+      block:
+        - name: List AutomationController resources
+          ansible.builtin.command:
+            cmd: >-
+              oc get automationcontrollers -n {{ _namespace }}
+              -o jsonpath='{.items[*].metadata.name}'
+          changed_when: false
+          register: _ac_names
+
+        - name: Assert an AutomationController exists
+          ansible.builtin.assert:
+            that:
+              - _ac_names.stdout | trim | length > 0
+            fail_msg: >-
+              No AutomationController resource found in namespace {{ _namespace }}.
+              Is AAP deployed here? Check with: oc get automationcontrollers -n {{ _namespace }}
+
+        - name: Set controller CR name
+          ansible.builtin.set_fact:
+            _ac_name: "{{ _ac_names.stdout.split() | first }}"
+
+        - name: Get current controller image from CR status
+          ansible.builtin.command:
+            cmd: >-
+              oc get automationcontroller {{ _ac_name }} -n {{ _namespace }}
+              -o jsonpath='{.status.image}'
+          changed_when: false
+          register: _current_image
+
+        - name: Get current controller version
+          ansible.builtin.command:
+            cmd: >-
+              oc get automationcontroller {{ _ac_name }} -n {{ _namespace }}
+              -o jsonpath='{.status.version}'
+          changed_when: false
+          register: _current_version
+
+        - name: Get current image override (if any)
+          ansible.builtin.command:
+            cmd: >-
+              oc get automationcontroller {{ _ac_name }} -n {{ _namespace }}
+              -o jsonpath='{.spec.image}'
+          changed_when: false
+          register: _current_override
+
+        - name: Display current state
+          ansible.builtin.debug:
+            msg: |
+              AutomationController: {{ _ac_name }}
+              Controller version:   {{ _current_version.stdout }}
+              Active image:         {{ _current_image.stdout }}
+              Image override:       {{ _current_override.stdout | default('(none — using operator default)', true) }}
+
+    # ==================================================================
+    # ROLLBACK (if requested)
+    # ==================================================================
+    - name: Rollback to stock image
+      when: rollback | bool
+      block:
+        - name: Remove image override from CR
+          ansible.builtin.command:
+            cmd: >-
+              oc patch automationcontroller/{{ _ac_name }} -n {{ _namespace }}
+              --type=json -p '[{"op":"remove","path":"/spec/image"}]'
+          register: _rollback_patch
+          changed_when: "'patched' in _rollback_patch.stdout"
+          failed_when: false
+
+        - name: Remove image_version override if present
+          ansible.builtin.command:
+            cmd: >-
+              oc patch automationcontroller/{{ _ac_name }} -n {{ _namespace }}
+              --type=json -p '[{"op":"remove","path":"/spec/image_version"}]'
+          changed_when: false
+          failed_when: false
+
+        - name: Wait for controller-web rollout
+          ansible.builtin.command:
+            cmd: >-
+              oc rollout status deployment/{{ _ac_name | regex_replace('-controller$', '') }}-controller-web
+              -n {{ _namespace }} --timeout={{ rollout_timeout }}s
+          changed_when: false
+
+        - name: Wait for controller-task rollout
+          ansible.builtin.command:
+            cmd: >-
+              oc rollout status deployment/{{ _ac_name | regex_replace('-controller$', '') }}-controller-task
+              -n {{ _namespace }} --timeout={{ rollout_timeout }}s
+          changed_when: false
+
+        - name: Rollback complete
+          ansible.builtin.debug:
+            msg: >-
+              Image override removed. The operator will revert to the stock
+              controller image on next reconciliation. The BeyondTrust
+              credential type will no longer be functional.
+          notify: end_play
+
+        - name: End play after rollback
+          ansible.builtin.meta: end_play
+
+    # ==================================================================
+    # VALIDATE CUSTOM IMAGE VARIABLE
+    # ==================================================================
+    - name: Validate custom_image is provided
+      ansible.builtin.assert:
+        that:
+          - custom_image is defined
+          - custom_image | length > 0
+        fail_msg: >-
+          custom_image is required.
+          Usage: ansible-playbook install-plugin-ocp.yml -e custom_image=quay.io/myorg/controller-beyondtrust:latest
+
+    # ==================================================================
+    # BUILD & PUSH (optional)
+    # ==================================================================
+    - name: Build and push custom image
+      when: build_and_push | bool
+      block:
+        - name: Detect container tool
+          block:
+            - name: Use provided container_tool
+              ansible.builtin.set_fact:
+                _container_tool: "{{ container_tool }}"
+              when: container_tool is defined
+
+            - name: Try podman
+              ansible.builtin.command:
+                cmd: podman --version
+              changed_when: false
+              register: _podman_check
+              ignore_errors: true
+              when: container_tool is not defined
+
+            - name: Try docker
+              ansible.builtin.command:
+                cmd: docker --version
+              changed_when: false
+              register: _docker_check
+              ignore_errors: true
+              when:
+                - container_tool is not defined
+                - _podman_check.rc | default(1) != 0
+
+            - name: Set container tool
+              ansible.builtin.set_fact:
+                _container_tool: >-
+                  {{ 'podman' if (_podman_check.rc | default(1)) == 0
+                     else 'docker' if (_docker_check.rc | default(1)) == 0
+                     else '' }}
+              when: container_tool is not defined
+
+            - name: Assert a container tool is available
+              ansible.builtin.assert:
+                that:
+                  - _container_tool | length > 0
+                fail_msg: >-
+                  Neither podman nor docker found. Install one, or build and
+                  push the image manually and run without -e build_and_push=true.
+
+        - name: Display build info
+          ansible.builtin.debug:
+            msg: |
+              Building with:  {{ _container_tool }}
+              Base image:     {{ _current_image.stdout }}
+              Custom image:   {{ custom_image }}
+              Source:         {{ plugin_source }}
+
+        - name: Verify plugin source files exist
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "{{ plugin_source }}/pyproject.toml"
+            - "{{ plugin_source }}/Containerfile"
+            - "{{ plugin_source }}/src/beyondtrust_credential_plugin/__init__.py"
+          register: _source_check
+
+        - name: Assert source files are present
+          ansible.builtin.assert:
+            that:
+              - item.stat.exists
+            fail_msg: "Missing: {{ item.item }}"
+          loop: "{{ _source_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: Build custom controller image
+          ansible.builtin.command:
+            cmd: >-
+              {{ _container_tool }} build
+              --build-arg BASE_IMAGE={{ _current_image.stdout }}
+              -t {{ custom_image }}
+              -f {{ plugin_source }}/Containerfile
+              {{ plugin_source }}
+          register: _build
+          changed_when: true
+
+        - name: Log in to registry (if credentials provided)
+          ansible.builtin.command:
+            cmd: >-
+              {{ _container_tool }} login
+              {{ registry_server | default(custom_image.split('/')[0]) }}
+              -u {{ registry_username }}
+              -p {{ registry_password }}
+          when:
+            - registry_username is defined
+            - registry_password is defined
+          changed_when: false
+          no_log: true
+
+        - name: Push custom image
+          ansible.builtin.command:
+            cmd: "{{ _container_tool }} push {{ custom_image }}"
+          register: _push
+          changed_when: true
+
+        - name: Build and push complete
+          ansible.builtin.debug:
+            msg: "Image pushed: {{ custom_image }}"
+
+    # ==================================================================
+    # CREATE PULL SECRET (optional)
+    # ==================================================================
+    - name: Create image pull secret
+      when: create_registry_secret | bool
+      block:
+        - name: Validate registry secret variables
+          ansible.builtin.assert:
+            that:
+              - registry_server is defined
+              - registry_username is defined
+              - registry_password is defined
+            fail_msg: >-
+              create_registry_secret requires registry_server,
+              registry_username, and registry_password.
+
+        - name: Set pull secret name
+          ansible.builtin.set_fact:
+            _pull_secret_name: "{{ registry_secret | default('beyondtrust-registry-pull') }}"
+
+        - name: Create docker-registry secret
+          ansible.builtin.command:
+            cmd: >-
+              oc create secret docker-registry {{ _pull_secret_name }}
+              -n {{ _namespace }}
+              --docker-server={{ registry_server }}
+              --docker-username={{ registry_username }}
+              --docker-password={{ registry_password }}
+              --dry-run=client -o yaml
+          changed_when: false
+          register: _secret_yaml
+          no_log: true
+
+        - name: Apply pull secret
+          ansible.builtin.command:
+            cmd: oc apply -f -
+            stdin: "{{ _secret_yaml.stdout }}"
+          changed_when: true
+          no_log: true
+
+        - name: Set registry_secret fact for CR patch
+          ansible.builtin.set_fact:
+            registry_secret: "{{ _pull_secret_name }}"
+
+    # ==================================================================
+    # PATCH THE AUTOMATIONCONTROLLER CR
+    # ==================================================================
+    - name: Patch AutomationController with custom image
+      block:
+        - name: Build patch payload
+          ansible.builtin.set_fact:
+            _cr_patch:
+              spec:
+                image: "{{ custom_image }}"
+
+        - name: Add image_pull_secrets to patch (if pull secret provided)
+          ansible.builtin.set_fact:
+            _cr_patch: >-
+              {{ _cr_patch | combine({
+                   'spec': _cr_patch.spec | combine({
+                     'image_pull_secrets': [registry_secret]
+                   })
+                 }, recursive=True) }}
+          when: registry_secret is defined
+
+        - name: Display patch
+          ansible.builtin.debug:
+            msg: |
+              Patching automationcontroller/{{ _ac_name }}:
+              {{ _cr_patch | to_nice_yaml(indent=2) }}
+
+        - name: Apply patch to AutomationController CR
+          ansible.builtin.command:
+            cmd: >-
+              oc patch automationcontroller/{{ _ac_name }} -n {{ _namespace }}
+              --type=merge -p '{{ _cr_patch | to_json }}'
+          register: _patch_result
+          changed_when: "'patched' in _patch_result.stdout"
+
+    # ==================================================================
+    # WAIT FOR ROLLOUT
+    # ==================================================================
+    - name: Determine deployment name prefix
+      ansible.builtin.command:
+        cmd: >-
+          oc get deployments -n {{ _namespace }}
+          -l app.kubernetes.io/managed-by=automationcontroller-operator
+          -o jsonpath='{.items[*].metadata.name}'
+      changed_when: false
+      register: _controller_deployments
+
+    - name: Set deployment names
+      ansible.builtin.set_fact:
+        _web_deployment: "{{ _controller_deployments.stdout.split() | select('search', 'web') | first }}"
+        _task_deployment: "{{ _controller_deployments.stdout.split() | select('search', 'task') | first }}"
+
+    - name: Display rollout targets
+      ansible.builtin.debug:
+        msg: "Waiting for rollout of {{ _web_deployment }} and {{ _task_deployment }}"
+
+    - name: Wait for controller-web rollout
+      ansible.builtin.command:
+        cmd: >-
+          oc rollout status deployment/{{ _web_deployment }}
+          -n {{ _namespace }} --timeout={{ rollout_timeout }}s
+      changed_when: false
+      register: _web_rollout
+
+    - name: Wait for controller-task rollout
+      ansible.builtin.command:
+        cmd: >-
+          oc rollout status deployment/{{ _task_deployment }}
+          -n {{ _namespace }} --timeout={{ rollout_timeout }}s
+      changed_when: false
+      register: _task_rollout
+
+    - name: Wait for controller pods to become ready
+      ansible.builtin.command:
+        cmd: >-
+          oc wait pods
+          -l app.kubernetes.io/name={{ _web_deployment }}
+          -n {{ _namespace }}
+          --for=condition=Ready --timeout={{ rollout_timeout }}s
+      changed_when: false
+
+    # ==================================================================
+    # REGISTER CREDENTIAL TYPES
+    # ==================================================================
+    - name: Get controller-web pod name
+      ansible.builtin.command:
+        cmd: >-
+          oc get pods -n {{ _namespace }}
+          -l app.kubernetes.io/name={{ _web_deployment }}
+          -o jsonpath='{.items[0].metadata.name}'
+      changed_when: false
+      register: _web_pod
+
+    - name: Determine controller container name
+      ansible.builtin.command:
+        cmd: >-
+          oc get pod {{ _web_pod.stdout }} -n {{ _namespace }}
+          -o jsonpath='{.spec.containers[*].name}'
+      changed_when: false
+      register: _web_containers
+
+    - name: Set web container name
+      ansible.builtin.set_fact:
+        _web_container: "{{ _web_containers.stdout.split() | select('search', 'web') | first }}"
+
+    - name: Register managed credential types
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ _namespace }} {{ _web_pod.stdout }}
+          -c {{ _web_container }} --
+          awx-manage setup_managed_credential_types
+      changed_when: true
+      register: _register_types
+
+    # ==================================================================
+    # VERIFY
+    # ==================================================================
+    - name: Verify plugin is loaded
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ _namespace }} {{ _web_pod.stdout }}
+          -c {{ _web_container }} --
+          /var/lib/awx/venv/awx/bin/python3 -c
+          "import importlib.metadata;
+          eps = importlib.metadata.entry_points().select(group='awx_plugins.credentials');
+          bt = [ep for ep in eps if 'beyondtrust' in ep.name];
+          assert bt, 'BeyondTrust plugin entry points not found';
+          [print(f'{ep.name} -> {ep.value}') for ep in bt]"
+      changed_when: false
+      register: _verify
+
+    - name: Assert plugin loaded
+      ansible.builtin.assert:
+        that:
+          - _verify.rc == 0
+          - "'beyondtrust' in _verify.stdout"
+        fail_msg: "Plugin failed to load: {{ _verify.stderr }}"
+        success_msg: "Plugin entry points found:\n{{ _verify.stdout }}"
+
+    - name: Verify credential type is registered in database
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ _namespace }} {{ _web_pod.stdout }}
+          -c {{ _web_container }} --
+          /var/lib/awx/venv/awx/bin/python3 -c
+          "from awx.main.models import CredentialType;
+          cts = CredentialType.objects.filter(name__icontains='beyondtrust');
+          assert cts.exists(), 'No BeyondTrust credential types in DB';
+          [print(f'{ct.name} (ID={ct.id}, kind={ct.kind})') for ct in cts]"
+      changed_when: false
+      register: _verify_db
+
+    - name: Display registered credential types
+      ansible.builtin.debug:
+        msg: "{{ _verify_db.stdout }}"
+
+    # ==================================================================
+    # SUMMARY
+    # ==================================================================
+    - name: Installation complete
+      ansible.builtin.debug:
+        msg: |
+          ✓ BeyondTrust credential plugin deployed to AAP on OpenShift.
+
+          Namespace:            {{ _namespace }}
+          AutomationController: {{ _ac_name }}
+          Custom image:         {{ custom_image }}
+          Credential types:
+          {{ _verify_db.stdout | indent(2, first=True) }}
+
+          The plugin is now available in the AAP UI under
+          Resources → Credentials → Add.
+
+          To rollback to the stock controller image:
+            ansible-playbook install-plugin-ocp.yml -e rollback=true{{ ' -e aap_namespace=' + _namespace if _namespace != 'aap' else '' }}
