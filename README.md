@@ -143,6 +143,27 @@ podman exec automation-controller-web awx-manage setup_managed_credential_types
 
 On OpenShift, AAP is managed by the **AutomationController operator**. Instead of manipulating podman containers directly, we patch the `AutomationController` custom resource with a custom image reference. The operator handles the rolling update.
 
+#### Deploy AAP on a fresh cluster
+
+Log in with `oc login` using an account with operator installation permissions, then run:
+
+```bash
+ansible-playbook deploy-aap-ocp.yml
+```
+
+Adapted from the `mad-hatter` deployment roles, this installs the AAP operator
+from the `stable-2.7` channel in namespace `aap`, then creates an
+`AnsibleAutomationPlatform` named `aap` with a gateway and controller. Hub, EDA,
+and Lightspeed are disabled for this plugin test environment. The playbook waits
+for both APIs and controller deployments to become ready, then prints the URL and
+command to retrieve the generated admin password. Activate an AAP subscription
+before launching jobs.
+
+Override `aap_namespace`, `aap_name`, or `aap_operator_channel` with `-e` as needed.
+The playbook requires only `ansible-core` and `oc`; it uses the current kubeconfig.
+Use the same kubeconfig for the plugin installation below. Keep credential files
+out of Git and container build contexts.
+
 #### Quick start (one command)
 
 If you have `podman` (or `docker`) locally and are logged into the cluster with `oc`:
@@ -196,15 +217,17 @@ To revert to the stock controller image:
 ansible-playbook install-plugin-ocp.yml -e rollback=true
 ```
 
-This removes the `image` override from the `AutomationController` CR. The operator reconciles and reverts to its default image.
+This removes the `image` and `image_version` overrides from the
+`AutomationController` CR and waits for both deployments to roll back to the
+operator's default image.
 
 #### How it works (OCP)
 
 1. **Queries** the `AutomationController` CR to discover the current base image
 2. **Builds** a custom image using the same `Containerfile` as RHEL (if `build_and_push=true`)
 3. **Pushes** to the specified registry
-4. **Patches** `spec.image` on the `AutomationController` CR
-5. The **operator reconciles** and performs a rolling update of the controller Deployments
+4. **Patches** `spec.image` and `spec.image_version` on the `AutomationController` CR
+5. **Waits** for the operator to apply the requested image and complete both controller rollouts
 6. **Registers** credential types via `awx-manage setup_managed_credential_types`
 7. **Verifies** the plugin entry points are loaded
 

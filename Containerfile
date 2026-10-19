@@ -12,7 +12,8 @@ FROM ${BASE_IMAGE}
 
 USER root
 
-COPY . /tmp/beyondtrust-plugin/
+COPY pyproject.toml README.md /tmp/beyondtrust-plugin/
+COPY src/ /tmp/beyondtrust-plugin/src/
 
 RUN /var/lib/awx/venv/awx/bin/pip install --no-cache-dir /tmp/beyondtrust-plugin/ && \
     rm -rf /tmp/beyondtrust-plugin/

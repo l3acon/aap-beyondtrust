@@ -123,13 +123,18 @@
           ansible.builtin.set_fact:
             _ac_name: "{{ _ac_names.stdout.split() | first }}"
 
-        - name: Get current controller image from CR status
+        - name: Get current controller image from the web deployment
           ansible.builtin.command:
             cmd: >-
-              oc get automationcontroller {{ _ac_name }} -n {{ _namespace }}
-              -o jsonpath='{.status.image}'
+              oc get deployment {{ _ac_name }}-web -n {{ _namespace }}
+              -o jsonpath='{.spec.template.spec.containers[?(@.name=="{{ _ac_name }}-web")].image}'
           changed_when: false
           register: _current_image
+
+        - name: Assert the running controller image was discovered
+          ansible.builtin.assert:
+            that: _current_image.stdout | trim | length > 0
+            fail_msg: The controller web deployment has no discoverable application image.
 
         - name: Get current controller version
           ansible.builtin.command:
@@ -147,6 +152,14 @@
           changed_when: false
           register: _current_override
 
+        - name: Get current image version override (if any)
+          ansible.builtin.command:
+            cmd: >-
+              oc get automationcontroller {{ _ac_name }} -n {{ _namespace }}
+              -o jsonpath='{.spec.image_version}'
+          changed_when: false
+          register: _current_override_version
+
         - name: Display current state
           ansible.builtin.debug:
             msg: |
@@ -161,44 +174,50 @@
     - name: Rollback to stock image
       when: rollback | bool
       block:
-        - name: Remove image override from CR
+        - name: Remove image and version overrides from CR
           ansible.builtin.command:
             cmd: >-
               oc patch automationcontroller/{{ _ac_name }} -n {{ _namespace }}
-              --type=json -p '[{"op":"remove","path":"/spec/image"}]'
+              --type=merge -p '{"spec":{"image":null,"image_version":null}}'
           register: _rollback_patch
           changed_when: "'patched' in _rollback_patch.stdout"
-          failed_when: false
 
-        - name: Remove image_version override if present
+        - name: Wait for the operator to restore deployment images
           ansible.builtin.command:
             cmd: >-
-              oc patch automationcontroller/{{ _ac_name }} -n {{ _namespace }}
-              --type=json -p '[{"op":"remove","path":"/spec/image_version"}]'
+              oc get deployment/{{ item }} -n {{ _namespace }}
+              -o jsonpath='{.spec.template.spec.containers[*].image}'
           changed_when: false
-          failed_when: false
+          register: _rollback_images
+          until: >-
+            _current_override.stdout | length == 0 or
+            (_current_override.stdout + ':' + _current_override_version.stdout)
+            not in _rollback_images.stdout.split()
+          retries: "{{ [(rollout_timeout | int // 5), 1] | max }}"
+          delay: 5
+          loop:
+            - "{{ _ac_name }}-web"
+            - "{{ _ac_name }}-task"
 
         - name: Wait for controller-web rollout
           ansible.builtin.command:
             cmd: >-
-              oc rollout status deployment/{{ _ac_name | regex_replace('-controller$', '') }}-controller-web
+              oc rollout status deployment/{{ _ac_name }}-web
               -n {{ _namespace }} --timeout={{ rollout_timeout }}s
           changed_when: false
 
         - name: Wait for controller-task rollout
           ansible.builtin.command:
             cmd: >-
-              oc rollout status deployment/{{ _ac_name | regex_replace('-controller$', '') }}-controller-task
+              oc rollout status deployment/{{ _ac_name }}-task
               -n {{ _namespace }} --timeout={{ rollout_timeout }}s
           changed_when: false
 
         - name: Rollback complete
           ansible.builtin.debug:
             msg: >-
-              Image override removed. The operator will revert to the stock
-              controller image on next reconciliation. The BeyondTrust
+              Image overrides removed and stock controller rollouts completed. The BeyondTrust
               credential type will no longer be functional.
-          notify: end_play
 
         - name: End play after rollback
           ansible.builtin.meta: end_play
@@ -214,6 +233,16 @@
         fail_msg: >-
           custom_image is required.
           Usage: ansible-playbook install-plugin-ocp.yml -e custom_image=quay.io/myorg/controller-beyondtrust:latest
+
+    - name: Split the image reference for the controller operator
+      ansible.builtin.set_fact:
+        _image_has_version: "{{ ':' in custom_image.rsplit('/', 1)[-1] }}"
+
+    - name: Set image repository and version
+      ansible.builtin.set_fact:
+        _image_repository: "{{ custom_image.rsplit(':', 1)[0] if _image_has_version else custom_image }}"
+        _image_version: "{{ custom_image.rsplit(':', 1)[1] if _image_has_version else 'latest' }}"
+        _target_image: "{{ custom_image if _image_has_version else custom_image + ':latest' }}"
 
     # ==================================================================
     # BUILD & PUSH (optional)
@@ -375,7 +404,8 @@
           ansible.builtin.set_fact:
             _cr_patch:
               spec:
-                image: "{{ custom_image }}"
+                image: "{{ _image_repository }}"
+                image_version: "{{ _image_version }}"
 
         - name: Add image_pull_secrets to patch (if pull secret provided)
           ansible.builtin.set_fact:
@@ -404,19 +434,24 @@
     # ==================================================================
     # WAIT FOR ROLLOUT
     # ==================================================================
-    - name: Determine deployment name prefix
-      ansible.builtin.command:
-        cmd: >-
-          oc get deployments -n {{ _namespace }}
-          -l app.kubernetes.io/managed-by=automationcontroller-operator
-          -o jsonpath='{.items[*].metadata.name}'
-      changed_when: false
-      register: _controller_deployments
-
     - name: Set deployment names
       ansible.builtin.set_fact:
-        _web_deployment: "{{ _controller_deployments.stdout.split() | select('search', 'web') | first }}"
-        _task_deployment: "{{ _controller_deployments.stdout.split() | select('search', 'task') | first }}"
+        _web_deployment: "{{ _ac_name }}-web"
+        _task_deployment: "{{ _ac_name }}-task"
+
+    - name: Wait for the operator to apply the requested image
+      ansible.builtin.command:
+        cmd: >-
+          oc get deployment/{{ item }} -n {{ _namespace }}
+          -o jsonpath='{.spec.template.spec.containers[*].image}'
+      changed_when: false
+      register: _deployment_images
+      until: _target_image in _deployment_images.stdout.split()
+      retries: "{{ [(rollout_timeout | int // 5), 1] | max }}"
+      delay: 5
+      loop:
+        - "{{ _web_deployment }}"
+        - "{{ _task_deployment }}"
 
     - name: Display rollout targets
       ansible.builtin.debug:
@@ -455,14 +490,22 @@
         cmd: >-
           oc get pods -n {{ _namespace }}
           -l app.kubernetes.io/name={{ _web_deployment }}
-          -o jsonpath='{.items[0].metadata.name}'
+          --field-selector=status.phase=Running
+          -o json
       changed_when: false
       register: _web_pod
+
+    - name: Select a current web pod
+      ansible.builtin.set_fact:
+        _web_pod_name: >-
+          {{ (_web_pod.stdout | from_json)['items']
+             | rejectattr('metadata.deletionTimestamp', 'defined')
+             | map(attribute='metadata.name') | first }}
 
     - name: Determine controller container name
       ansible.builtin.command:
         cmd: >-
-          oc get pod {{ _web_pod.stdout }} -n {{ _namespace }}
+          oc get pod {{ _web_pod_name }} -n {{ _namespace }}
           -o jsonpath='{.spec.containers[*].name}'
       changed_when: false
       register: _web_containers
@@ -474,7 +517,7 @@
     - name: Register managed credential types
       ansible.builtin.command:
         cmd: >-
-          oc exec -n {{ _namespace }} {{ _web_pod.stdout }}
+          oc exec -n {{ _namespace }} {{ _web_pod_name }}
           -c {{ _web_container }} --
           awx-manage setup_managed_credential_types
       changed_when: true
@@ -486,7 +529,7 @@
     - name: Verify plugin is loaded
       ansible.builtin.command:
         cmd: >-
-          oc exec -n {{ _namespace }} {{ _web_pod.stdout }}
+          oc exec -n {{ _namespace }} {{ _web_pod_name }}
           -c {{ _web_container }} --
           /var/lib/awx/venv/awx/bin/python3 -c
           "import importlib.metadata;
@@ -508,9 +551,9 @@
     - name: Verify credential type is registered in database
       ansible.builtin.command:
         cmd: >-
-          oc exec -n {{ _namespace }} {{ _web_pod.stdout }}
+          oc exec -n {{ _namespace }} {{ _web_pod_name }}
           -c {{ _web_container }} --
-          /var/lib/awx/venv/awx/bin/python3 -c
+          awx-manage shell -c
           "from awx.main.models import CredentialType;
           cts = CredentialType.objects.filter(name__icontains='beyondtrust');
           assert cts.exists(), 'No BeyondTrust credential types in DB';
